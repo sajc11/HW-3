@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# client.py:
-
 import socket
 import json
 import argparse
@@ -10,13 +7,23 @@ import sys
 import time
 import datetime
 import struct
-from message import UnencryptedIMMessage
+from message import EncryptedIMMessage
+from Crypto.Hash import SHA256
+
 
 def parseArgs():
     """
     parse the command-line arguments
     """
     parser = argparse.ArgumentParser()
+    parser.add_argument('--confkey', '-c', 
+        dest="confkey", 
+        required=True,
+        help='confidentiality key')
+    parser.add_argument('--authkey', '-a', 
+        dest="authkey", 
+        required=True,
+        help='authenticity key')       
     parser.add_argument('--port', '-p', 
         dest="port", 
         type=int, 
@@ -38,116 +45,81 @@ def parseArgs():
     args = parser.parse_args()
     return args
 
+
+
+
+# Updated: Return a tuple of two SHA-256 binary digests.
+# The first digest is computed from the confidentiality key (confkey)
+# and the second digest is computed from the authenticity key (authkey).
+# Both keys are first converted to ASCII-encoded bytes, and then hashed.
+# Note: Do not use hexdigest()—return the raw byte digest.
+def hashKeys(confkey, authkey):
+    # Convert the keys to ASCII-encoded bytes
+    confkey_bytes = bytes(confkey, 'ascii')
+    authkey_bytes = bytes(authkey, 'ascii')
+    
+    # Compute the SHA-256 hash for each key and obtain the raw binary digest
+    confkeyHash = SHA256.new(data=confkey_bytes).digest()
+    authkeyHash = SHA256.new(data=authkey_bytes).digest()
+    
+    return confkeyHash, authkeyHash
+
+
+
 def main():
     args = parseArgs()
 
-    # set up the logger
     log = logging.getLogger("myLogger")
     logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s')
     level = logging.getLevelName(args.loglevel)
     
     log.setLevel(level)
     log.info(f"running with {args}")
-    
-    log.debug(f"Attempting to connect to server {args.server} on port {args.port}")
 
-    try:
-        s = socket.create_connection((args.server,args.port))
-        log.info("connected to server")
-    except:
-        log.error("cannot connect")
-        exit(1)
+    hashedConfkey,hashedAuthkey = hashKeys(args.confkey, args.authkey)
+    
+    log.debug(f"connecting to server {args.server}")
+    s = socket.create_connection((args.server,args.port))
 
     readSet = [s] + [sys.stdin]
 
+    dataLenSize = struct.calcsize('!L')
+
     while True:
-        try:
-            readable, _, exceptional = select.select(readSet, [], readSet)
-            
-            for source in readable:
-                if source == sys.stdin:
-                    # Handle user input
-                    line = sys.stdin.readline()
-                    if not line:  # EOF (Ctrl+D)
-                        log.debug("EOF detected, exiting...")
-                        return
+        rl, _, _ = select.select(readSet, [], [])
 
-                    # Check message length before sending
-                    if len(line.strip()) > 4096:  # 4KB limit
-                        log.error("Message too long. Max size: 4KB")
-                        continue
-                        
-                    # Create and send message
-                    if line.strip():  # Only send non-empty messages
-                        msg = UnencryptedIMMessage(args.nickname, line.strip())
-                        try:
-                            packedSize, jsonData = msg.serialize()
-                            s.sendall(packedSize + jsonData)
-                            log.debug(f"Sent message: {line.strip()}")
-                        except (BrokenPipeError, ConnectionResetError):
-                            log.error("Lost connection to server. Exiting...")
-                            return
-                        except Exception as e:
-                            log.error(f"Error sending message: {e}")
-                            return
-                            
-                else:  # source == s (socket)
-                    try:
-                        # Get message length
-                        packedLen = s.recv(4, socket.MSG_WAITALL)
-                        if not packedLen:
-                            log.error("Server has shut down. Exiting...")
-                            return
-                            
-                        # Get message length and verify it's reasonable
-                        msgLen = struct.unpack("!L", packedLen)[0]
-                        if msgLen > 4096:  # 4KB limit
-                            log.error(f"Message too large ({msgLen} bytes)")
-                            continue
-                        
-                        # Get message
-                        jsonData = s.recv(msgLen, socket.MSG_WAITALL)
-                        if not jsonData:
-                            log.error("Server closed connection during message receive")
-                            return
-                        
-                        # Validate JSON before parsing
-                        try:
-                            json.loads(jsonData)
-                        except json.JSONDecodeError as e:
-                            log.debug(f"Received invalid JSON: {e}")
-                            continue
-                            
-                        # Parse and print message
-                        try:
-                            msg = UnencryptedIMMessage()
-                            msg.parseJSON(jsonData)
-                            print(msg)  # Print exactly as required
-                        except Exception as e:
-                            log.debug(f"Error parsing message: {e}")
-                            continue
-                        
-                    except (ConnectionResetError, BrokenPipeError):
-                        log.error("Lost connection to server")
-                        return
-                    except Exception as e:
-                        log.error(f"Error receiving message: {e}")
-                        return
-            
-            # Handle exceptional conditions
-            if exceptional:
-                log.error("Socket exception occurred")
-                return
-                
-        except KeyboardInterrupt:
-            log.info("Interrupted by user")
-            break
-        except Exception as e:
-            log.error(f"Unexpected error: {e}")
-            break
+        if s in rl:
+            log.debug(f"waiting for {dataLenSize} bytes")
+            try:
+                packedSize = s.recv(dataLenSize,socket.MSG_WAITALL)
+                if len(packedSize) == 0:
+                    log.fatal("server disconnected!")
+                    exit(1)
+                unpackedSize = struct.unpack("!L",packedSize)[0]
+                log.debug(f"message is {unpackedSize} bytes")
+                data = s.recv(unpackedSize,socket.MSG_WAITALL)
+            except Exception as err:
+                log.error(f"exception occurred: {err}")
+            msg = EncryptedIMMessage()
+            try:
+                msg.parseJSON(data,hashedConfkey,hashedAuthkey)
+            except Exception as err:
+                log.warning(f"invalid message received: {err}")
+            print(msg)
 
-    s.close()
-    log.debug("Connection closed")
+        if sys.stdin in rl:
+            keyboardInput = sys.stdin.readline()
+            if len(keyboardInput) == 0:
+                exit(0)
+            msg = EncryptedIMMessage(
+                nickname=args.nickname, 
+                plaintext=keyboardInput)
+            packedSize, jsonData = msg.serialize(hashedConfkey,hashedAuthkey)
+            s.send(packedSize)
+            log.debug(f"sending raw JSON: {jsonData}")
+            s.send(jsonData)
+
 
 if __name__ == "__main__":
     exit(main())
+

@@ -1,2 +1,1 @@
-# HW-3
- Homework 3 - Encryptd Messaging System
+# cosc4705-spring2024-hw3
